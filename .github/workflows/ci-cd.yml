@@ -1,0 +1,373 @@
+name: Image Processing CI/CD Pipeline
+
+on:
+  push:
+    branches: [ main, develop, 'feature/**', 'release/**' ]
+  pull_request:
+    branches: [ main, develop ]
+  workflow_dispatch:
+    inputs:
+      environment:
+        description: 'Environment to deploy to'
+        required: true
+        default: 'staging'
+        type: choice
+        options:
+          - staging
+          - production
+
+jobs:
+  # Code quality checks
+  lint:
+    name: Lint and Format Check
+    runs-on: ubuntu-latest
+    strategy:
+      matrix:
+        component: [frontend, backend, ml-service]
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      - name: Set up Node.js (Frontend)
+        if: matrix.component == 'frontend'
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+      
+      - name: Install frontend dependencies
+        if: matrix.component == 'frontend'
+        working-directory: ./frontend
+        run: npm ci
+      
+      - name: Lint frontend
+        if: matrix.component == 'frontend'
+        working-directory: ./frontend
+        run: npm run lint
+      
+      - name: Set up Python (Backend & ML Service)
+        if: matrix.component == 'backend' || matrix.component == 'ml-service'
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+          cache-dependency-path: |
+            backend/requirements.txt
+            ml-service/requirements.txt
+      
+      - name: Install backend dependencies
+        if: matrix.component == 'backend'
+        working-directory: ./backend
+        run: pip install -r requirements.txt
+      
+      - name: Lint backend
+        if: matrix.component == 'backend'
+        working-directory: ./backend
+        run: |
+          pip install flake8 black
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+          black --check .
+      
+      - name: Install ML service dependencies
+        if: matrix.component == 'ml-service'
+        working-directory: ./ml-service
+        run: pip install -r requirements.txt
+      
+      - name: Lint ML service
+        if: matrix.component == 'ml-service'
+        working-directory: ./ml-service
+        run: |
+          pip install flake8 black
+          flake8 . --count --select=E9,F63,F7,F82 --show-source --statistics
+          black --check .
+
+  # Security scanning
+  security-scan:
+    name: Security Scanning
+    runs-on: ubuntu-latest
+    needs: lint
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      - name: Run Trivy vulnerability scanner for Docker images
+        uses: aquasecurity/trivy-action@master
+        with:
+          scan-type: 'fs'
+          scan-ref: '.'
+          format: 'table'
+          exit-code: '1'
+          ignore-unfixed: true
+          severity: 'CRITICAL,HIGH'
+      
+      - name: Run dependency scanning
+        uses: snyk/actions/node@master
+        with:
+          args: --all-projects
+        env:
+          SNYK_TOKEN: ${{ secrets.SNYK_TOKEN }}
+        continue-on-error: true
+
+  # Unit and integration tests
+  test:
+    name: Run Tests
+    runs-on: ubuntu-latest
+    needs: lint
+    
+    services:
+      postgres:
+        image: postgres:14-alpine
+        env:
+          POSTGRES_USER: postgres
+          POSTGRES_PASSWORD: postgres
+          POSTGRES_DB: test_db
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+      
+      redis:
+        image: redis:7-alpine
+        ports:
+          - 6379:6379
+        options: >-
+          --health-cmd "redis-cli ping"
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      # Frontend tests
+      - name: Set up Node.js
+        uses: actions/setup-node@v3
+        with:
+          node-version: '18'
+          cache: 'npm'
+          cache-dependency-path: frontend/package-lock.json
+      
+      - name: Install frontend dependencies
+        working-directory: ./frontend
+        run: npm ci
+      
+      - name: Run frontend tests
+        working-directory: ./frontend
+        run: npm test -- --coverage
+      
+      # Backend tests
+      - name: Set up Python
+        uses: actions/setup-python@v4
+        with:
+          python-version: '3.10'
+          cache: 'pip'
+          cache-dependency-path: |
+            backend/requirements.txt
+            backend/requirements-dev.txt
+      
+      - name: Install backend dependencies
+        working-directory: ./backend
+        run: |
+          pip install -r requirements.txt
+          pip install -r requirements-dev.txt
+      
+      - name: Run backend tests
+        working-directory: ./backend
+        run: pytest --cov=app --cov-report=xml
+        env:
+          DATABASE_URL: postgresql://postgres:postgres@localhost:5432/test_db
+          REDIS_URL: redis://localhost:6379/0
+          TESTING: "true"
+      
+      # ML Service tests
+      - name: Install ML service dependencies
+        working-directory: ./ml-service
+        run: pip install -r requirements.txt
+      
+      - name: Run ML service tests
+        working-directory: ./ml-service
+        run: pytest --cov=app --cov-report=xml
+      
+      # Upload coverage reports
+      - name: Upload coverage to Codecov
+        uses: codecov/codecov-action@v3
+        with:
+          files: ./backend/coverage.xml,./frontend/coverage/coverage-final.json
+          flags: unittests
+          fail_ci_if_error: false
+          verbose: true
+
+  # Build and push Docker images
+  build:
+    name: Build and Push Docker Images
+    runs-on: ubuntu-latest
+    needs: [test, security-scan]
+    if: github.event_name == 'push' || github.event_name == 'workflow_dispatch'
+    
+    strategy:
+      matrix:
+        component: [frontend, backend, ml-service]
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+      
+      - name: Login to GitHub Container Registry
+        uses: docker/login-action@v2
+        with:
+          registry: ghcr.io
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+      
+      - name: Extract metadata
+        id: meta
+        uses: docker/metadata-action@v4
+        with:
+          images: ghcr.io/${{ github.repository }}/${{ matrix.component }}
+          tags: |
+            type=ref,event=branch
+            type=ref,event=pr
+            type=semver,pattern={{version}}
+            type=sha,format=long,prefix=
+      
+      - name: Build and push Docker image
+        uses: docker/build-push-action@v4
+        with:
+          context: ./${{ matrix.component }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
+
+  # Deploy to staging environment
+  deploy-staging:
+    name: Deploy to Staging
+    runs-on: ubuntu-latest
+    needs: build
+    if: (github.ref == 'refs/heads/develop' && github.event_name == 'push') || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'staging')
+    environment: staging
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.26.0'
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+      
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name ${{ vars.EKS_CLUSTER_NAME }} --region ${{ vars.AWS_REGION }}
+      
+      - name: Set image names
+        run: |
+          COMMIT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          echo "FRONTEND_IMAGE=ghcr.io/${{ github.repository }}/frontend:sha-$COMMIT_SHA" >> $GITHUB_ENV
+          echo "BACKEND_IMAGE=ghcr.io/${{ github.repository }}/backend:sha-$COMMIT_SHA" >> $GITHUB_ENV
+          echo "ML_SERVICE_IMAGE=ghcr.io/${{ github.repository }}/ml-service:sha-$COMMIT_SHA" >> $GITHUB_ENV
+      
+      - name: Deploy to Kubernetes
+        run: |
+          # Update image tags in the deployment manifests
+          cd k8s/staging
+          sed -i "s|image: .*frontend.*|image: ${{ env.FRONTEND_IMAGE }}|g" frontend-deployment.yaml
+          sed -i "s|image: .*backend.*|image: ${{ env.BACKEND_IMAGE }}|g" backend-deployment.yaml
+          sed -i "s|image: .*ml-service.*|image: ${{ env.ML_SERVICE_IMAGE }}|g" ml-service-deployment.yaml
+          
+          # Apply the updated manifests
+          kubectl apply -f .
+      
+      - name: Verify deployment
+        run: |
+          kubectl rollout status deployment/frontend -n image-processor-staging
+          kubectl rollout status deployment/backend -n image-processor-staging
+          kubectl rollout status deployment/ml-service -n image-processor-staging
+      
+      - name: Run smoke tests
+        run: |
+          echo "Running basic smoke tests against staging environment"
+          STAGING_URL=${{ vars.STAGING_BASE_URL }}
+          
+          # Check the health endpoint
+          curl -f $STAGING_URL/api/health
+          
+          # Add more comprehensive smoke tests here
+
+  # Deploy to production environment
+  deploy-production:
+    name: Deploy to Production
+    runs-on: ubuntu-latest
+    needs: build
+    if: (github.ref == 'refs/heads/main' && github.event_name == 'push') || (github.event_name == 'workflow_dispatch' && github.event.inputs.environment == 'production')
+    environment: production
+    
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v3
+      
+      - name: Set up kubectl
+        uses: azure/setup-kubectl@v3
+        with:
+          version: 'v1.26.0'
+      
+      - name: Configure AWS credentials
+        uses: aws-actions/configure-aws-credentials@v2
+        with:
+          aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+          aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+          aws-region: ${{ vars.AWS_REGION }}
+      
+      - name: Update kubeconfig
+        run: aws eks update-kubeconfig --name ${{ vars.EKS_CLUSTER_NAME }} --region ${{ vars.AWS_REGION }}
+      
+      - name: Set image names
+        run: |
+          COMMIT_SHA=$(echo ${{ github.sha }} | cut -c1-7)
+          echo "FRONTEND_IMAGE=ghcr.io/${{ github.repository }}/frontend:sha-$COMMIT_SHA" >> $GITHUB_ENV
+          echo "BACKEND_IMAGE=ghcr.io/${{ github.repository }}/backend:sha-$COMMIT_SHA" >> $GITHUB_ENV
+          echo "ML_SERVICE_IMAGE=ghcr.io/${{ github.repository }}/ml-service:sha-$COMMIT_SHA" >> $GITHUB_ENV
+      
+      - name: Deploy to Kubernetes
+        run: |
+          # Update image tags in the deployment manifests
+          cd k8s/production
+          sed -i "s|image: .*frontend.*|image: ${{ env.FRONTEND_IMAGE }}|g" frontend-deployment.yaml
+          sed -i "s|image: .*backend.*|image: ${{ env.BACKEND_IMAGE }}|g" backend-deployment.yaml
+          sed -i "s|image: .*ml-service.*|image: ${{ env.ML_SERVICE_IMAGE }}|g" ml-service-deployment.yaml
+          
+          # Apply the updated manifests
+          kubectl apply -f .
+      
+      - name: Verify deployment
+        run: |
+          kubectl rollout status deployment/frontend -n image-processor-production
+          kubectl rollout status deployment/backend -n image-processor-production
+          kubectl rollout status deployment/ml-service -n image-processor-production
+      
+      - name: Run smoke tests
+        run: |
+          echo "Running basic smoke tests against production environment"
+          PRODUCTION_URL=${{ vars.PROD_BASE_URL }}
+          
+          # Check the health endpoint
+          curl -f $PRODUCTION_URL/api/health
+          
+          # Add more comprehensive smoke tests here
