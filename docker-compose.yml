@@ -1,0 +1,283 @@
+version: '3.8'
+
+services:
+  # Frontend Service with modern UI
+  frontend:
+    build:
+      context: ./frontend
+      dockerfile: Dockerfile
+    container_name: image-processor-ui
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    environment:
+      - NODE_ENV=production
+      - REACT_APP_API_URL=http://localhost:8000/api
+      - REACT_APP_WS_URL=ws://localhost:8000/ws
+    volumes:
+      - frontend_build:/app/build
+    depends_on:
+      - backend
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "wget", "--spider", "http://localhost:3000"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # Backend API Service
+  backend:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile
+    container_name: image-processor-api
+    restart: unless-stopped
+    ports:
+      - "8000:8000"
+    environment:
+      - ENVIRONMENT=production
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/imageprocessor
+      - REDIS_URL=redis://redis:6379/0
+      - MODEL_PATH=/app/models
+      - LOG_LEVEL=info
+      - CORS_ORIGINS=http://localhost:3000
+      - MAX_WORKERS=4
+      - SECRET_KEY=${SECRET_KEY:-defaultdevsecretkey}
+      - JWT_SECRET=${JWT_SECRET:-defaultdevjwtsecret}
+      - JWT_ALGORITHM=HS256
+      - JWT_EXPIRATION=86400
+    volumes:
+      - ./backend:/app
+      - model_data:/app/models
+      - ./data/images:/app/data/images
+      - ./data/processed:/app/data/processed
+    depends_on:
+      - db
+      - redis
+      - ml-service
+    networks:
+      - app-network
+      - db-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/api/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 30s
+
+  # ML Service for model inference
+  ml-service:
+    build:
+      context: ./ml-service
+      dockerfile: Dockerfile
+    container_name: image-processor-ml
+    restart: unless-stopped
+    environment:
+      - TF_FORCE_GPU_ALLOW_GROWTH=true
+      - CUDA_VISIBLE_DEVICES=${CUDA_VISIBLE_DEVICES:-}
+      - MODEL_CACHE_DIR=/app/model_cache
+      - LOG_LEVEL=info
+    volumes:
+      - model_data:/app/model_cache
+      - ./data/images:/app/data/images
+      - ./data/processed:/app/data/processed
+    deploy:
+      resources:
+        limits:
+          cpus: '2'
+          memory: 4G
+    networks:
+      - app-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:5000/health"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 60s
+
+  # Database
+  db:
+    image: postgres:14-alpine
+    container_name: image-processor-db
+    restart: unless-stopped
+    environment:
+      - POSTGRES_USER=postgres
+      - POSTGRES_PASSWORD=postgres
+      - POSTGRES_DB=imageprocessor
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./db/init:/docker-entrypoint-initdb.d
+    ports:
+      - "5432:5432"
+    networks:
+      - db-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 10s
+
+  # Redis for caching and task queue
+  redis:
+    image: redis:7-alpine
+    container_name: image-processor-redis
+    restart: unless-stopped
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - db-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 3
+      start_period: 5s
+
+  # Task Queue Worker
+  worker:
+    build:
+      context: ./backend
+      dockerfile: Dockerfile.worker
+    container_name: image-processor-worker
+    restart: unless-stopped
+    environment:
+      - ENVIRONMENT=production
+      - DATABASE_URL=postgresql://postgres:postgres@db:5432/imageprocessor
+      - REDIS_URL=redis://redis:6379/0
+      - MODEL_SERVICE_URL=http://ml-service:5000
+      - LOG_LEVEL=info
+    volumes:
+      - ./backend:/app
+      - ./data/images:/app/data/images
+      - ./data/processed:/app/data/processed
+    depends_on:
+      - backend
+      - redis
+      - ml-service
+    networks:
+      - app-network
+      - db-network
+    deploy:
+      replicas: 2
+      resources:
+        limits:
+          cpus: '1'
+          memory: 2G
+
+  # Prometheus for metrics collection
+  prometheus:
+    image: prom/prometheus:v2.43.0
+    container_name: image-processor-prometheus
+    restart: unless-stopped
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./monitoring/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml
+      - prometheus_data:/prometheus
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    networks:
+      - monitoring-network
+    depends_on:
+      - backend
+      - frontend
+    profiles: ["monitoring"]
+
+  # Grafana for visualization
+  grafana:
+    image: grafana/grafana:9.5.1
+    container_name: image-processor-grafana
+    restart: unless-stopped
+    ports:
+      - "3100:3000"
+    volumes:
+      - ./monitoring/grafana/provisioning:/etc/grafana/provisioning
+      - grafana_data:/var/lib/grafana
+    environment:
+      - GF_SECURITY_ADMIN_USER=admin
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    networks:
+      - monitoring-network
+    depends_on:
+      - prometheus
+    profiles: ["monitoring"]
+
+  # MinIO for object storage (images and models)
+  minio:
+    image: minio/minio:RELEASE.2023-05-04T21-44-30Z
+    container_name: image-processor-minio
+    restart: unless-stopped
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=minioadmin
+    volumes:
+      - minio_data:/data
+    command: server /data --console-address ":9001"
+    networks:
+      - app-network
+    profiles: ["storage"]
+
+  # Adminer for database management
+  adminer:
+    image: adminer:4.8.1
+    container_name: image-processor-adminer
+    restart: unless-stopped
+    ports:
+      - "8080:8080"
+    environment:
+      - ADMINER_DEFAULT_SERVER=db
+    networks:
+      - db-network
+    depends_on:
+      - db
+    profiles: ["dev"]
+
+  # Jaeger for distributed tracing
+  jaeger:
+    image: jaegertracing/all-in-one:1.44
+    container_name: image-processor-jaeger
+    restart: unless-stopped
+    ports:
+      - "5775:5775/udp"
+      - "6831:6831/udp"
+      - "6832:6832/udp"
+      - "5778:5778"
+      - "16686:16686"
+      - "14250:14250"
+      - "14268:14268"
+      - "14269:14269"
+    environment:
+      - COLLECTOR_ZIPKIN_HOST_PORT=9411
+    networks:
+      - monitoring-network
+    profiles: ["monitoring"]
+
+networks:
+  app-network:
+    driver: bridge
+  db-network:
+    driver: bridge
+  monitoring-network:
+    driver: bridge
+
+volumes:
+  postgres_data:
+  redis_data:
+  model_data:
+  prometheus_data:
+  grafana_data:
+  frontend_build:
+  minio_data:
